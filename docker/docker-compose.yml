@@ -1,4 +1,5 @@
-version: "3.8" # Updated version
+version: "3.8"
+
 services:
   mariadb:
     image: mariadb:10.8
@@ -6,9 +7,13 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --skip-character-set-client-handshake
-      - --skip-innodb-read-only-compressed # Temporary fix for MariaDB 10.6
+      - --skip-innodb-read-only-compressed
+      - --innodb-file-format=Barracuda        # Required for Frappe DDL stability
+      - --innodb-large-prefix=1               # Prevents structural index key length limits
+      - --transaction-isolation=READ-COMMITTED # Standard Frappe isolation requirement
     environment:
-      MYSQL_ROOT_PASSWORD: 123
+      # Secure implementation: Pass via Coolify's environment variable panel
+      MYSQL_ROOT_PASSWORD: ${SERVICE_PASSWORD_MARIADB:-123}
     volumes:
       - mariadb-data:/var/lib/mysql
 
@@ -16,13 +21,15 @@ services:
     image: redis:alpine
 
   frappe:
-    image: frappe/bench:latest
-    command: tail -f /dev/null
+    # Build inline to guarantee file safety instead of pulling raw image
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Explicitly invoke bash and handle permission layer safely
+    command: /bin/bash -c "chmod +x /workspace/init.sh && /bin/bash /workspace/init.sh"
     environment:
       - SHELL=/bin/bash
     working_dir: /home/frappe
-    volumes:
-      - .:/workspace
     ports:
       - 8002:8002
       - 9000:9000
