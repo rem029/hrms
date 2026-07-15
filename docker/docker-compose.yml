@@ -20,12 +20,17 @@ services:
     command: bash /workspace/init.sh
     environment:
       - SHELL=/bin/bash
+      - REDIS_CACHE=redis://redis:6379
+      - REDIS_QUEUE=redis://redis:6379
+      - REDIS_SOCKETIO=redis://redis:6379
     working_dir: /home/frappe
     volumes:
       - .:/workspace
     ports:
       - 8002:8002
       - 9000:9000
+    depends_on:
+      - redis
 
 volumes:
   mariadb-data:
