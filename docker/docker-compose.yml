@@ -18,6 +18,8 @@ services:
   frappe:
     build: .
     command: bash /home/frappe/init.sh
+    labels:
+      - traefik.http.services.frappe.loadbalancer.server.port=8000
     environment:
       - SHELL=/bin/bash
       - REDIS_CACHE=redis://redis:6379
