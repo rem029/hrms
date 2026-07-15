@@ -24,7 +24,7 @@ services:
     volumes:
       - .:/workspace
     ports:
-      - 8000:8000
+      - 8002:8002
       - 9000:9000
 
 volumes:
