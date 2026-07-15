@@ -27,7 +27,7 @@ services:
     volumes:
       - .:/workspace
     ports:
-      - 8002:8002
+      - 8002:8000
       - 9000:9000
     depends_on:
       - redis
