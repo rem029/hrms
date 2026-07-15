@@ -1,4 +1,4 @@
 FROM frappe/bench:latest
 
-COPY init.sh /home/frappe/init.sh
+COPY --chown=frappe:frappe init.sh /home/frappe/init.sh
 RUN chmod +x /home/frappe/init.sh
