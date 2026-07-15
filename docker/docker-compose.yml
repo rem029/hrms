@@ -16,8 +16,8 @@ services:
     image: redis:alpine
 
   frappe:
-    image: frappe/bench:latest
-    command: bash /workspace/init.sh
+    build: .
+    command: bash /home/frappe/init.sh
     environment:
       - SHELL=/bin/bash
       - REDIS_CACHE=redis://redis:6379
