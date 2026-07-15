@@ -8,31 +8,34 @@ services:
       - --collation-server=utf8mb4_unicode_ci
       - --skip-character-set-client-handshake
       - --skip-innodb-read-only-compressed
-      - --innodb-file-format=Barracuda        # Required for Frappe DDL stability
-      - --innodb-large-prefix=1               # Prevents structural index key length limits
-      - --transaction-isolation=READ-COMMITTED # Standard Frappe isolation requirement
+      - --innodb-file-format=Barracuda        # Crucial for Frappe schema migration stability
+      - --innodb-large-prefix=1               # Prevents structural index key length limit errors
+      - --transaction-isolation=READ-COMMITTED # Mandatory Frappe ACID isolation level
     environment:
-      # Secure implementation: Pass via Coolify's environment variable panel
+      # Secure Implementation: Handled via Coolify Environment Variables UI
       MYSQL_ROOT_PASSWORD: ${SERVICE_PASSWORD_MARIADB:-123}
     volumes:
       - mariadb-data:/var/lib/mysql
 
   redis:
     image: redis:alpine
+    restart: always
 
   frappe:
-    # Build inline to guarantee file safety instead of pulling raw image
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # Explicitly invoke bash and handle permission layer safely
+    image: frappe/bench:latest
     command: /bin/bash -c "chmod +x /workspace/init.sh && /bin/bash /workspace/init.sh"
     environment:
       - SHELL=/bin/bash
     working_dir: /home/frappe
+    volumes:
+      - .:/workspace
     ports:
       - 8002:8002
       - 9000:9000
+    restart: always
+    depends_on:
+      - mariadb
+      - redis
 
 volumes:
   mariadb-data:
