@@ -120,10 +120,11 @@ DUPLICATE_EXC_TYPES = {
     "BackDatedAllocationError",
     "AttendanceAlreadyMarkedError",
     "InsufficientLeaveBalanceError",
+    "OverlappingShiftAttendanceError",
 }
 
 
-def create(doctype, data, quiet_duplicates=False):
+def create(doctype, data, quiet_duplicates=False, log=True):
     """POST a new doc. If data includes docstatus=1, Frappe submits it
     inline (fires on_submit / ledger entries) in the same call."""
     resp = _request("POST", f"/api/resource/{doctype}", json=data)
@@ -138,7 +139,10 @@ def create(doctype, data, quiet_duplicates=False):
             return None
         print(f"  [FAIL] {doctype}: {resp.status_code} {resp.text[:300]}")
         return None
-    return resp.json()["data"]
+    result = resp.json()["data"]
+    if log:
+        print(f"  + {doctype}: {result['name']}")
+    return result
 
 
 def random_employee_id(max_attempts=20):
@@ -174,7 +178,6 @@ def business_days(start, end):
 def ensure_leave_types():
     for lt in LEAVE_TYPES:
         if not exists("Leave Type", [["name", "=", lt]]):
-            print(f"Creating Leave Type: {lt}")
             create("Leave Type", {"leave_type_name": lt, "is_earned_leave": 0})
 
 
@@ -241,7 +244,6 @@ def ensure_holiday_list(company, today):
         return
 
     if not exists("Holiday List", [["name", "=", list_name]]):
-        print(f"  Creating Holiday List: {list_name}")
         create(
             "Holiday List",
             {
@@ -252,7 +254,6 @@ def ensure_holiday_list(company, today):
             },
         )
 
-    print(f"  Assigning Holiday List to {company}")
     create(
         "Holiday List Assignment",
         {
@@ -290,6 +291,48 @@ def ensure_designations():
         if not exists("Designation", [["name", "=", desig]]):
             create("Designation", {"designation_name": desig})
     return DESIGNATIONS
+
+
+SHIFT_NAME = "Day Shift"
+SHIFT_START = clock_time(9, 0)
+SHIFT_END = clock_time(18, 0)
+LATE_GRACE_MINUTES = 15
+EARLY_EXIT_GRACE_MINUTES = 15
+
+
+def ensure_shift_type():
+    if exists("Shift Type", [["name", "=", SHIFT_NAME]]):
+        return SHIFT_NAME
+    create(
+        "Shift Type",
+        {
+            "name": SHIFT_NAME,  # Shift Type's naming rule is "Set by User"
+            "start_time": SHIFT_START.strftime("%H:%M:%S"),
+            "end_time": SHIFT_END.strftime("%H:%M:%S"),
+            "enable_late_entry_marking": 1,
+            "late_entry_grace_period": LATE_GRACE_MINUTES,
+            "enable_early_exit_marking": 1,
+            "early_exit_grace_period": EARLY_EXIT_GRACE_MINUTES,
+        },
+    )
+    return SHIFT_NAME
+
+
+def ensure_shift_assignment(emp_name, company, start_date):
+    if exists("Shift Assignment", [["employee", "=", emp_name], ["shift_type", "=", SHIFT_NAME]]):
+        return
+    create(
+        "Shift Assignment",
+        {
+            "employee": emp_name,
+            "company": company,
+            "shift_type": SHIFT_NAME,
+            "start_date": str(start_date),
+            "status": "Active",
+            "docstatus": 1,
+        },
+        quiet_duplicates=True,
+    )
 
 
 def unique_personal_email(max_attempts=10):
@@ -334,7 +377,7 @@ def seed_employee(company, index, today, start_date, departments, designations):
             "department": random.choice(departments) if departments else None,
             "designation": random.choice(designations) if designations else None,
         }
-        doc = create("Employee", payload)
+        doc = create("Employee", payload, log=False)  # a nicer custom line follows below
         if not doc:
             print(
                 "  -> Employee creation failed, likely a missing mandatory field on "
@@ -347,9 +390,10 @@ def seed_employee(company, index, today, start_date, departments, designations):
             f"{payload['personal_email']}) [slot: {email}]"
         )
 
+    ensure_shift_assignment(emp_name, company, start_date)
     leave_dates = seed_leave(emp_name, company, today, start_date)
     seed_attendance(emp_name, company, today, start_date, leave_dates)
-    seed_checkins(emp_name, start_date, today)
+    seed_checkins(emp_name, start_date, today)  # backfill for any older rows created before shift tracking existed
     seed_payroll(emp_name, company, today)
 
 
@@ -373,7 +417,6 @@ def ensure_salary_structure(company, currency):
     name = f"Standard - {company}"
     if exists("Salary Structure", [["name", "=", name]]):
         return name
-    print(f"  Creating Salary Structure: {name}")
     create(
         "Salary Structure",
         {
@@ -395,6 +438,14 @@ def seed_payroll(emp_name, company, today):
     structure_name = ensure_salary_structure(company, currency)
     month_start, month_end = last_full_month(today)
 
+    doj_rows = get_list("Employee", filters=[["name", "=", emp_name]], fields=["date_of_joining"], limit=1)
+    date_of_joining = date.fromisoformat(doj_rows[0]["date_of_joining"]) if doj_rows else month_start
+    if date_of_joining > month_end:
+        return  # wasn't employed yet during the last full month -- nothing to pay them for
+
+    # Assignment from_date can't be before the employee's joining date.
+    assignment_from = max(month_start, date_of_joining)
+
     if not exists("Salary Structure Assignment", [["employee", "=", emp_name]]):
         create(
             "Salary Structure Assignment",
@@ -403,14 +454,17 @@ def seed_payroll(emp_name, company, today):
                 "salary_structure": structure_name,
                 "company": company,
                 "currency": currency,
-                "from_date": str(month_start),
+                "from_date": str(assignment_from),
                 "base": round(random.uniform(6000, 15000), 2),
                 "docstatus": 1,
             },
             quiet_duplicates=True,
         )
 
-    if exists("Salary Slip", [["employee", "=", emp_name], ["start_date", "=", str(month_start)]]):
+    # Slip period can't start before the assignment takes effect either.
+    slip_start = assignment_from
+
+    if exists("Salary Slip", [["employee", "=", emp_name], ["start_date", "=", str(slip_start)]]):
         return
     doc = create(
         "Salary Slip",
@@ -419,7 +473,7 @@ def seed_payroll(emp_name, company, today):
             "company": company,
             "posting_date": str(month_end),
             "salary_structure": structure_name,
-            "start_date": str(month_start),
+            "start_date": str(slip_start),
             "end_date": str(month_end),
             "currency": currency,
         },
@@ -585,6 +639,43 @@ def seed_leave(emp_name, company, today, start_date):
     return all_leave_dates
 
 
+def generate_shift_times(d):
+    """~20% chance of a late arrival (past the grace period), ~10% chance of
+    an early exit -- everything else lands within the shift's grace window."""
+    if random.random() < 0.2:
+        in_offset = LATE_GRACE_MINUTES + random.randint(1, 30)
+    else:
+        in_offset = random.randint(-15, LATE_GRACE_MINUTES - 1)
+    check_in = datetime.combine(d, SHIFT_START) + timedelta(minutes=in_offset)
+
+    if random.random() < 0.1:
+        out_offset = -(EARLY_EXIT_GRACE_MINUTES + random.randint(1, 30))
+    else:
+        out_offset = random.randint(-(EARLY_EXIT_GRACE_MINUTES - 1), 60)
+    check_out = datetime.combine(d, SHIFT_END) + timedelta(minutes=out_offset)
+
+    late_entry = in_offset > LATE_GRACE_MINUTES
+    early_exit = out_offset < -EARLY_EXIT_GRACE_MINUTES
+    return check_in, check_out, late_entry, early_exit
+
+
+def create_checkin_pair(emp_name, check_in, check_out):
+    for log_type, ts in (("IN", check_in), ("OUT", check_out)):
+        create(
+            "Employee Checkin",
+            {
+                "employee": emp_name,
+                "log_type": log_type,
+                "shift": SHIFT_NAME,
+                "time": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                # Not linking `attendance`: Frappe's validate_time_change() throws
+                # "cannot modify time" if attendance+time are both set on insert.
+                "skip_auto_attendance": 1,  # Attendance already created separately; don't let a background job double up
+            },
+            quiet_duplicates=True,
+        )
+
+
 def seed_attendance(emp_name, company, today, start_date, leave_dates):
     for d in business_days(start_date, today):
         if d in leave_dates:
@@ -592,18 +683,45 @@ def seed_attendance(emp_name, company, today, start_date, leave_dates):
         if exists("Attendance", [["employee", "=", emp_name], ["attendance_date", "=", str(d)]]):
             continue
         status = random.choices([s for s, _ in ATTENDANCE_STATUS_WEIGHTS], weights=[w for _, w in ATTENDANCE_STATUS_WEIGHTS])[0]
-        create(
-            "Attendance",
-            {
-                "employee": emp_name,
-                "attendance_date": str(d),
-                "company": company,
-                "status": status,
-                "working_hours": 0 if status == "Absent" else round(random.uniform(WORKING_HOURS_MIN, WORKING_HOURS_MAX), 2),
-                "docstatus": 1,  # submit inline; don't rely on any site-side auto-submit
-            },
-            quiet_duplicates=True,
-        )
+
+        payload = {
+            "employee": emp_name,
+            "attendance_date": str(d),
+            "company": company,
+            "status": status,
+            "docstatus": 1,  # submit inline; don't rely on any site-side auto-submit
+        }
+
+        check_in = check_out = None
+        if status == "Absent":
+            payload["working_hours"] = 0
+        else:
+            check_in, check_out, late_entry, early_exit = generate_shift_times(d)
+            payload["working_hours"] = round((check_out - check_in).total_seconds() / 3600, 2)
+            payload["shift"] = SHIFT_NAME
+            payload["late_entry"] = 1 if late_entry else 0
+            payload["early_exit"] = 1 if early_exit else 0
+
+        doc = create("Attendance", payload, quiet_duplicates=True)
+        if doc and check_in:
+            create_checkin_pair(emp_name, check_in, check_out)
+
+
+def next_employee_index(company):
+    """EMPLOYEES_PER_COMPANY new employees should be created on every run,
+    not just once -- so start counting from whatever slot index is already
+    the highest for this company instead of always starting back at 1
+    (which would just keep re-hitting existing slots and skipping)."""
+    prefix = f"{company.lower().replace(' ', '_')}_emp_"
+    rows = get_list(
+        "Employee", filters=[["company_email", "like", f"{prefix}%@example.com"]], fields=["company_email"]
+    )
+    max_index = 0
+    for row in rows:
+        suffix = row["company_email"][len(prefix) :].split("@")[0]
+        if suffix.isdigit():
+            max_index = max(max_index, int(suffix))
+    return max_index + 1
 
 
 def main():
@@ -616,13 +734,15 @@ def main():
     print(f"Found companies: {companies}")
 
     ensure_leave_types()
+    ensure_shift_type()
     designations = ensure_designations()
 
     for company in companies:
         print(f"\nSeeding company: {company}")
         ensure_holiday_list(company, today)
         departments = ensure_departments(company)
-        for i in range(1, EMPLOYEES_PER_COMPANY + 1):
+        start_index = next_employee_index(company)
+        for i in range(start_index, start_index + EMPLOYEES_PER_COMPANY):
             seed_employee(company, i, today, start_date, departments, designations)
 
     print("\nDone.")
